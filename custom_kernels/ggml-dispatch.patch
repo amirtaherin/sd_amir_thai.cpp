@@ -1,0 +1,65 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 08383edb..f3608c9e 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -2180,6 +2180,36 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+     return use_mul_mat_vec_q;
+ }
+ 
++// =====================================================================================
++// custom_kernels integration (out-of-tree, see sd_amir_thai.cpp/custom_kernels/).
++// When CUSTOM_KERNEL_VERSION is defined at compile time, the use_mul_mat_q branch
++// below routes Q8_0 weights + F32 activations through the selected variant. Other
++// quantized types (e.g. the Q4_K LLM) fall back to stock ggml_cuda_mul_mat_q.
++// =====================================================================================
++#if defined(CUSTOM_KERNEL_VERSION)
++void custom_kernels_mmq_thai_vu(
++    ggml_backend_cuda_context & ctx,
++    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++    const char * src0_dd_i, const float * src1_ddf_i,
++    const char * src1_ddq_i, float * dst_dd_i,
++    const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
++    const int64_t src1_padded_row_size, cudaStream_t stream);
++void custom_kernels_mmq_amir_v1(
++    ggml_backend_cuda_context & ctx,
++    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++    const char * src0_dd_i, const float * src1_ddf_i,
++    const char * src1_ddq_i, float * dst_dd_i,
++    const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
++    const int64_t src1_padded_row_size, cudaStream_t stream);
++void custom_kernels_mmq_amir_v2(
++    ggml_backend_cuda_context & ctx,
++    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++    const char * src0_dd_i, const float * src1_ddf_i,
++    const char * src1_ddq_i, float * dst_dd_i,
++    const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
++    const int64_t src1_padded_row_size, cudaStream_t stream);
++#endif
++
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+ 
+@@ -2249,7 +2279,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+     } else if (!split && use_mul_mat_vec_q) {
+         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+     } else if (!split && use_mul_mat_q) {
++#if defined(CUSTOM_KERNEL_VERSION)
++        if (src0->type == GGML_TYPE_Q8_0 && src1->type == GGML_TYPE_F32) {
++#  if   CUSTOM_KERNEL_VERSION == 1
++            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, custom_kernels_mmq_thai_vu, nullptr);
++#  elif CUSTOM_KERNEL_VERSION == 2
++            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, custom_kernels_mmq_amir_v1, nullptr);
++#  elif CUSTOM_KERNEL_VERSION == 3
++            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, custom_kernels_mmq_amir_v2, nullptr);
++#  else
++#    error "Unknown CUSTOM_KERNEL_VERSION (expected 1, 2, or 3)"
++#  endif
++        } else {
++            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
++        }
++#else
+         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
++#endif
+     } else if (!split && (use_batched_cublas_f16 || use_batched_cublas_bf16 || use_batched_cublas_f32)
+         && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2]*src1->ne[3] > 1) {
+         // general KQ + KQV multi-batch without FlashAttention

@@ -273,6 +273,12 @@ if (NOT TARGET ggml)
     endif()
 endif()
 
+# Out-of-tree custom INT8 kernel variants. Inject sources into ggml-cuda and
+# expose CUSTOM_KERNEL_VERSION to pick the active variant (see custom_kernels/README.md).
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/custom_kernels/CMakeLists.txt")
+    add_subdirectory(custom_kernels)
+endif()
+
 add_subdirectory(thirdparty)
 
 target_link_libraries(${SD_LIB} PUBLIC ggml zip)
