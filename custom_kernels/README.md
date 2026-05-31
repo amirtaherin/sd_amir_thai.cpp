@@ -32,6 +32,7 @@ custom_kernels/
 | `1` | `thai_vu` | Re-converts Q8_0 → INT8 weights on every matmul call. | `exp015` |
 | `2` | `amir_v1` | Caches the Q8_0 → INT8 weight conversion per weight tensor. | `exp016` |
 | `3` | `amir_v2` | `amir_v1` + memory-coalesced INT32 → FP32 dequant. **Beats cuBLAS.** | `exp017` |
+| `4` | `amir_v3` | `amir_v2` + eager INT8 conversion at model load (no step-1 spike). **Default. ~27 % faster than cuBLAS.** | `exp018` |
 
 Non-Q8_0 quantized weights (e.g. the Q4_K Mistral text encoder) fall back to
 stock `ggml_cuda_mul_mat_q`, so a full sd-cli run works without `--clip-on-cpu`.

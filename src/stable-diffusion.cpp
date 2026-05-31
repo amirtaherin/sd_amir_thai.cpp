@@ -1,6 +1,10 @@
 #include "ggml_extend.hpp"
 #include "ggml_graph_cut.h"
 
+#if defined(CUSTOM_KERNEL_VERSION) && (CUSTOM_KERNEL_VERSION >= 4)
+#include "custom_kernels.h"
+#endif
+
 #include "model.h"
 #include "rng.hpp"
 #include "rng_mt19937.hpp"
@@ -1057,6 +1061,22 @@ public:
                 pmid_params_mem_size / 1024.0 / 1024.0,
                 params_memory_location(pmid_params_mem_size, SDBackendModule::PHOTOMAKER));
         }
+
+#if defined(CUSTOM_KERNEL_VERSION) && (CUSTOM_KERNEL_VERSION >= 4)
+        // amir_v3: pre-convert all Q8_0 diffusion weights to INT8 at load time
+        // so amir_v2's matmul cache is already warm on step 1 (kills the 4.67 s
+        // step-1 spike measured in exp017).
+        if (diffusion_model) {
+            std::map<std::string, struct ggml_tensor *> diffusion_tensors;
+            diffusion_model->get_param_tensors(diffusion_tensors);
+            custom_kernels::preload_q8_0_weights(diffusion_tensors);
+        }
+        if (high_noise_diffusion_model) {
+            std::map<std::string, struct ggml_tensor *> hi_noise_tensors;
+            high_noise_diffusion_model->get_param_tensors(hi_noise_tensors);
+            custom_kernels::preload_q8_0_weights(hi_noise_tensors);
+        }
+#endif
 
         // init denoiser
         {
