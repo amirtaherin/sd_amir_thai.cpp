@@ -1,8 +1,8 @@
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 08383edb..6192b288 100644
+index 08383edb..c54b0bb5 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -2180,6 +2180,36 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+@@ -2180,6 +2180,43 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
      return use_mul_mat_vec_q;
  }
  
@@ -34,12 +34,19 @@ index 08383edb..6192b288 100644
 +    const char * src1_ddq_i, float * dst_dd_i,
 +    const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
 +    const int64_t src1_padded_row_size, cudaStream_t stream);
++void custom_kernels_mmq_amir_v4(
++    ggml_backend_cuda_context & ctx,
++    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++    const char * src0_dd_i, const float * src1_ddf_i,
++    const char * src1_ddq_i, float * dst_dd_i,
++    const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
++    const int64_t src1_padded_row_size, cudaStream_t stream);
 +#endif
 +
  static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
  
-@@ -2249,7 +2279,26 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -2249,7 +2286,30 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
      } else if (!split && use_mul_mat_vec_q) {
          ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
      } else if (!split && use_mul_mat_q) {
@@ -54,8 +61,12 @@ index 08383edb..6192b288 100644
 +#  elif CUSTOM_KERNEL_VERSION == 4
 +            // amir_v3 reuses amir_v2's matmul; the difference is load-time cache fill
 +            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, custom_kernels_mmq_amir_v2, nullptr);
++#  elif CUSTOM_KERNEL_VERSION == 5
++            // amir_v4 -- CUTLASS-fused epilogue (SKELETON, see custom_kernels/src/cutlass_improvement.md).
++            // Currently falls back to amir_v2's pipeline; will be the fused GEMM once implemented.
++            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, custom_kernels_mmq_amir_v4, nullptr);
 +#  else
-+#    error "Unknown CUSTOM_KERNEL_VERSION (expected 1, 2, 3, or 4)"
++#    error "Unknown CUSTOM_KERNEL_VERSION (expected 1, 2, 3, 4, or 5)"
 +#  endif
 +        } else {
 +            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);

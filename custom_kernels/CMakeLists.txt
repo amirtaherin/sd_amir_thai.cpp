@@ -23,21 +23,25 @@ endif()
 #   2 = amir_v1  (cached weight conversion;                    exp016)
 #   3 = amir_v2  (cached + coalesced dequant;                  exp017)
 #   4 = amir_v3  (amir_v2 + load-time INT8 weight conversion;  exp018)  [default]
+#   5 = amir_v4  (CUTLASS fused-epilogue; SKELETON, falls back to amir_v3 today)
 # ----------------------------------------------------------------------------
 set(CUSTOM_KERNEL_VERSION "4" CACHE STRING
-    "Custom INT8 kernel variant: 1=thai_vu, 2=amir_v1, 3=amir_v2, 4=amir_v3")
-set_property(CACHE CUSTOM_KERNEL_VERSION PROPERTY STRINGS "1" "2" "3" "4")
+    "Custom INT8 kernel variant: 1=thai_vu, 2=amir_v1, 3=amir_v2, 4=amir_v3, 5=amir_v4")
+set_property(CACHE CUSTOM_KERNEL_VERSION PROPERTY STRINGS "1" "2" "3" "4" "5")
 
 # ----------------------------------------------------------------------------
 # Sources — always compile all variants so swapping is just a recompile of the
 # dispatch hook, not of every variant. Unused variants are dead code in the binary.
 # preload.cu is the amir_v3-specific entry point called from stable-diffusion.cpp.
+# amir_v4.cu is currently a SKELETON (see src/cutlass_improvement.md) — falls
+# back to amir_v2's pipeline until the CUTLASS body is implemented.
 # ----------------------------------------------------------------------------
 set(CUSTOM_KERNEL_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/int8_helpers.cu
     ${CMAKE_CURRENT_LIST_DIR}/src/thai_vu.cu
     ${CMAKE_CURRENT_LIST_DIR}/src/amir_v1.cu
     ${CMAKE_CURRENT_LIST_DIR}/src/amir_v2.cu
+    ${CMAKE_CURRENT_LIST_DIR}/src/amir_v4.cu
     ${CMAKE_CURRENT_LIST_DIR}/src/preload.cu
 )
 
@@ -69,4 +73,4 @@ if (TARGET stable-diffusion)
 endif()
 
 message(STATUS "custom_kernels: variant=${CUSTOM_KERNEL_VERSION} "
-               "(1=thai_vu, 2=amir_v1, 3=amir_v2, 4=amir_v3)")
+               "(1=thai_vu, 2=amir_v1, 3=amir_v2, 4=amir_v3, 5=amir_v4[skel])")

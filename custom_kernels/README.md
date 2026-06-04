@@ -33,6 +33,7 @@ custom_kernels/
 | `2` | `amir_v1` | Caches the Q8_0 → INT8 weight conversion per weight tensor. | `exp016` |
 | `3` | `amir_v2` | `amir_v1` + memory-coalesced INT32 → FP32 dequant. **Beats cuBLAS.** | `exp017` |
 | `4` | `amir_v3` | `amir_v2` + eager INT8 conversion at model load (no step-1 spike). **Default. ~27 % faster than cuBLAS.** | `exp018` |
+| `5` | `amir_v4` | **SKELETON.** CUTLASS-fused INT8 GEMM with per-row × per-col scale epilogue (no INT32 buffer, no standalone dequant). Currently falls back to amir_v2's pipeline; see `src/cutlass_improvement.md`. | `exp020` (planned) |
 
 Non-Q8_0 quantized weights (e.g. the Q4_K Mistral text encoder) fall back to
 stock `ggml_cuda_mul_mat_q`, so a full sd-cli run works without `--clip-on-cpu`.
