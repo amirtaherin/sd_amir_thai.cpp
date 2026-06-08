@@ -57,3 +57,24 @@ struct cached_int8_weight {
 // Process-global cache, keyed by the weight tensor's device pointer
 // (stable because ggml loads weights once into a fixed backend buffer).
 extern std::unordered_map<const void *, cached_int8_weight> g_amir_int8_weight_cache;
+
+/*
+Function to perform INT8 GEMM + dequantization in one step, using CUTLASS.
+- A: [M, K], row-major INT8
+- B: [N, K], row-major INT8 
+- alphaRow: [M] row scales
+- alphaCol: [N] column scales
+- D: [M, N], column-major FP32 output
+*/
+bool matmul_w8a8_cutlass_cuda(
+    const int8_t* A,                  // [M, K_gemm], row-major
+    const int8_t* B,                  // [N_gemm, K_gemm], row-major physical memory
+    const float* alphaRow,            // [M]
+    const float* alphaCol,            // [N_gemm]
+    float* D,                         // [M, N_gemm], column-major physical memory
+    int M,
+    int N_gemm,
+    int K_gemm,
+    int ldc,
+    cudaStream_t stream
+);

@@ -331,3 +331,337 @@ void convert_q8_0_to_int8_row_wise_cuda(
                 cudaGetErrorString(err));
     }
 }
+
+
+#include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/default_gemm_universal_with_visitor.h"
+#include "cutlass/epilogue/threadblock/fusion/visitors.hpp"
+
+/*
+    Fused INT8 GEMM + row/column scaling + FP32 output.
+
+    Input:
+        A        : int8  [M, K_gemm], row-major
+        B        : int8  [N_gemm, K_gemm], row-major physical memory
+        alphaRow : float [M]
+        alphaCol : float [N_gemm]
+
+    Output:
+        D        : float [M, N_gemm], column-major physical memory
+
+    Logical math:
+        D = A @ B^T
+
+        A      = [M, K_gemm]
+        B      = [N_gemm, K_gemm]
+        B^T    = [K_gemm, N_gemm]
+        D      = [M, N_gemm]
+
+    Epilogue:
+        D[m, n] = float(acc_i32[m, n]) * alphaRow[m] * alphaCol[n]
+
+    Physical output layout:
+        D[m, n] is stored at:
+
+            D[m + n * ldc]
+
+    This matches your working INT8 -> INT32 CUTLASS path and your old
+    dequantization kernel.
+*/
+template <typename TileShape, typename WarpShape, int kStages>
+bool matmul_w8a8_cutlass_f32_ptr(
+    const int8_t* A,        // [M, K_gemm], row-major
+    const int8_t* B,        // [N_gemm, K_gemm], row-major physical memory
+    const float* alphaRow,  // [M]
+    const float* alphaCol,  // [N_gemm]
+    float* D,               // [M, N_gemm], column-major physical memory
+    int32_t M,
+    int32_t N_gemm,
+    int32_t K_gemm,
+    int32_t ldc,
+    cudaStream_t stream
+) {
+    if (!A || !B || !alphaRow || !alphaCol || !D) {
+        fprintf(stderr, "matmul_w8a8_cutlass_f32_ptr: null pointer input\n");
+        return false;
+    }
+
+    if (M <= 0 || N_gemm <= 0 || K_gemm <= 0) {
+        fprintf(stderr, "matmul_w8a8_cutlass_f32_ptr: invalid shape\n");
+        return false;
+    }
+
+    if (ldc < M) {
+        fprintf(stderr,
+                "matmul_w8a8_cutlass_f32_ptr: invalid ldc. ldc=%d, M=%d\n",
+                ldc, M);
+        return false;
+    }
+
+    if (K_gemm % 32 != 0) {
+        fprintf(stderr,
+                "matmul_w8a8_cutlass_f32_ptr: K_gemm must be multiple of 32. K_gemm=%d\n",
+                K_gemm);
+        return false;
+    }
+
+    using ElementA = int8_t;
+    using ElementB = int8_t;
+    using ElementScale = float;
+    using ElementC = float;
+    using ElementOutput = float;
+    using ElementAccumulator = int32_t;
+    using ElementCompute = float;
+
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+
+    constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;  // 16 int8
+    constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;  // 16 int8
+
+    // Safe scalar FP32 output store
+    constexpr int AlignmentC = 1;
+
+    constexpr int EVTEpilogueStages = 1;
+
+    using namespace cute;
+
+    using OutputTileThreadMap =
+        cutlass::epilogue::threadblock::OutputTileThreadLayout<
+            TileShape,
+            WarpShape,
+            ElementC,
+            AlignmentC,
+            EVTEpilogueStages>;
+
+    using Accum =
+        cutlass::epilogue::threadblock::VisitorAccFetch;
+
+    /*
+        alphaRow[m]
+
+        This broadcasts one scale per output row.
+    */
+    using RowScaleBroadcast =
+        cutlass::epilogue::threadblock::VisitorColBroadcast<
+            OutputTileThreadMap,
+            ElementScale,
+            cute::Stride<_1, _0, int32_t>>;
+
+    /*
+        alphaCol[n]
+
+        This broadcasts one scale per output column.
+    */
+    using ColScaleBroadcast =
+        cutlass::epilogue::threadblock::VisitorRowBroadcast<
+            OutputTileThreadMap,
+            ElementScale,
+            cute::Stride<_0, _1, int32_t>>;
+
+    /*
+        First multiply:
+
+            acc * alphaRow[m]
+    */
+    using ComputeRowScale =
+        cutlass::epilogue::threadblock::VisitorCompute<
+            cutlass::multiplies,
+            ElementCompute,
+            ElementCompute,
+            cutlass::FloatRoundStyle::round_to_nearest>;
+
+    using EVTRowScale =
+        cutlass::epilogue::threadblock::Sm80EVT<
+            ComputeRowScale,
+            Accum,
+            RowScaleBroadcast>;
+
+    /*
+        Second multiply:
+
+            (acc * alphaRow[m]) * alphaCol[n]
+    */
+    using ComputeColScale =
+        cutlass::epilogue::threadblock::VisitorCompute<
+            cutlass::multiplies,
+            ElementCompute,
+            ElementCompute,
+            cutlass::FloatRoundStyle::round_to_nearest>;
+
+    using EVTRowColScale =
+        cutlass::epilogue::threadblock::Sm80EVT<
+            ComputeColScale,
+            EVTRowScale,
+            ColScaleBroadcast>;
+
+    /*
+        Store FP32 output in column-major physical layout:
+
+            D[m, n] -> D[m + n * ldc]
+
+        Therefore stride is:
+
+            stride_m     = 1
+            stride_n     = ldc
+            stride_batch = ldc * N_gemm
+    */
+    using StoreD =
+        cutlass::epilogue::threadblock::VisitorAuxStore<
+            OutputTileThreadMap,
+            ElementOutput,
+            cutlass::FloatRoundStyle::round_to_nearest,
+            cute::Stride<_1, int64_t, int64_t>>;
+
+    using EVTD =
+        cutlass::epilogue::threadblock::Sm80EVT<
+            StoreD,
+            EVTRowColScale>;
+
+    using Kernel =
+        typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
+            ElementA, LayoutA, cutlass::ComplexTransform::kNone, AlignmentA,
+            ElementB, LayoutB, cutlass::ComplexTransform::kNone, AlignmentB,
+            ElementC, LayoutC, AlignmentC,
+            ElementAccumulator,
+            ElementCompute,
+            cutlass::arch::OpClassTensorOp,
+            cutlass::arch::Sm80,
+            TileShape,
+            WarpShape,
+            cutlass::gemm::GemmShape<16, 8, 32>,
+            EVTD,
+            cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>,
+            kStages,
+            cutlass::arch::OpMultiplyAddSaturate,
+            EVTEpilogueStages
+        >::GemmKernel;
+
+    using DeviceGemm =
+        cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+
+    typename EVTD::Arguments callback_args{
+        {
+            {
+                {},
+                {alphaRow, ElementScale(0), {_1{}, _0{}, int32_t(M)}},
+                {}
+            },
+            {alphaCol, ElementScale(0), {_0{}, _1{}, int32_t(N_gemm)}},
+            {}
+        },
+        {
+            D,
+            {_1{}, int64_t{ldc}, int64_t{ldc} * int64_t{N_gemm}}
+        }
+    };
+
+    typename DeviceGemm::Arguments arguments(
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {M, N_gemm, K_gemm},
+        1,
+        callback_args,
+
+        A,
+        B,
+        nullptr,
+        nullptr,
+
+        int64_t(M) * int64_t(K_gemm),
+        int64_t(N_gemm) * int64_t(K_gemm),
+        0,
+        0,
+
+        int64_t(K_gemm),  // lda: A row-major [M, K_gemm]
+        int64_t(K_gemm),  // ldb: B viewed as column-major [K_gemm, N_gemm]
+        0,
+        0
+    );
+
+    DeviceGemm gemm_op;
+
+    size_t workspace_size = DeviceGemm::get_workspace_size(arguments);
+
+    void* workspace = nullptr;
+    if (workspace_size > 0) {
+        CUDA_CHECK(cudaMalloc(&workspace, workspace_size));
+    }
+
+    cutlass::Status status;
+
+    status = gemm_op.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) {
+        if (workspace) cudaFree(workspace);
+        CUTLASS_CHECK(status);
+    }
+
+    status = gemm_op.initialize(arguments, workspace, stream);
+    if (status != cutlass::Status::kSuccess) {
+        if (workspace) cudaFree(workspace);
+        CUTLASS_CHECK(status);
+    }
+
+    status = gemm_op(stream);
+
+    /*
+        Debugging helper.
+
+        You can remove this after the kernel is stable.
+        This helps catch CUTLASS errors immediately instead of later in NORM.
+    */
+#if 0
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUTLASS launch error: %s\n", cudaGetErrorString(err));
+        if (workspace) cudaFree(workspace);
+        return false;
+    }
+
+    err = cudaStreamSynchronize(stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUTLASS runtime error: %s\n", cudaGetErrorString(err));
+        if (workspace) cudaFree(workspace);
+        return false;
+    }
+#endif
+
+    if (workspace) {
+        cudaFree(workspace);
+    }
+
+    CUTLASS_CHECK(status);
+
+    return true;
+}
+
+
+bool matmul_w8a8_cutlass_cuda(
+    const int8_t* A,
+    const int8_t* B,
+    const float* alphaRow,
+    const float* alphaCol,
+    float* D,
+    int M,
+    int N_gemm,
+    int K_gemm,
+    int32_t ldc,
+    cudaStream_t stream
+) {
+    using TileShape = cutlass::gemm::GemmShape<128, 128, 64>;
+    using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
+    constexpr int kStages = 3;
+
+    return matmul_w8a8_cutlass_f32_ptr<TileShape, WarpShape, kStages>(
+        A,
+        B,
+        alphaRow,
+        alphaCol,
+        D,
+        M,
+        N_gemm,
+        K_gemm,
+        ldc,
+        stream
+    );
+}
