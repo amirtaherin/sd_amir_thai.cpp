@@ -13,3 +13,8 @@ output*.png
 models*
 *.log
 preview.png
+
+# CUTLASS checkout for amir_v4 (CUSTOM_KERNEL_VERSION=5). Not tracked: clone
+# it locally and point CMake at it with -DCUTLASS_DIR=$PWD/cutlass.
+# See custom_kernels/README.md and custom_kernels/src/amir_v4_implementation.md.
+/cutlass/

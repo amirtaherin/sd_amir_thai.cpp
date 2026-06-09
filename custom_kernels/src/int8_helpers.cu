@@ -333,9 +333,45 @@ void convert_q8_0_to_int8_row_wise_cuda(
 }
 
 
+// =====================================================================================
+// amir_v4 — fused INT8 GEMM + per-row × per-col dequant (CUTLASS).
+// Implementation by Thai Vu.
+//
+// This block is only compiled when the build system defines
+// CUSTOM_KERNEL_HAVE_CUTLASS (set by custom_kernels/CMakeLists.txt when
+// -DCUTLASS_DIR=/path/to/cutlass is provided). Without CUTLASS, the rest of
+// the helpers still build and CUSTOM_KERNEL_VERSION ∈ {1..4} continue to
+// work; CUSTOM_KERNEL_VERSION=5 (amir_v4) aborts at runtime.
+//
+// See custom_kernels/src/amir_v4_implementation.md for the technical
+// write-up; src/cutlass_improvement.md for the original design doc.
+// =====================================================================================
+#if defined(CUSTOM_KERNEL_HAVE_CUTLASS)
+
+// CUDA_CHECK lives in ggml-cuda's internal common.cuh. The rest of this file
+// uses plain cudaGetLastError + fprintf, but Thai Vu's CUTLASS code uses
+// CUDA_CHECK directly so we pull it in here.
+#include "common.cuh"
+
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/default_gemm_universal_with_visitor.h"
 #include "cutlass/epilogue/threadblock/fusion/visitors.hpp"
+
+// CUTLASS upstream doesn't ship a canonical CUTLASS_CHECK macro; many of the
+// examples define their own. Provide a fallback so int8_helpers.cu compiles
+// against arbitrary CUTLASS revisions. If a future CUTLASS header defines
+// CUTLASS_CHECK, that definition will take precedence.
+#ifndef CUTLASS_CHECK
+#define CUTLASS_CHECK(status)                                                 \
+    do {                                                                      \
+        cutlass::Status _cutlass_status = (status);                           \
+        if (_cutlass_status != cutlass::Status::kSuccess) {                   \
+            fprintf(stderr, "CUTLASS error: %s:%d (status=%d)\n",             \
+                    __FILE__, __LINE__, (int) _cutlass_status);               \
+            abort();                                                          \
+        }                                                                     \
+    } while (0)
+#endif
 
 /*
     Fused INT8 GEMM + row/column scaling + FP32 output.
@@ -379,6 +415,7 @@ bool matmul_w8a8_cutlass_f32_ptr(
     int32_t N_gemm,
     int32_t K_gemm,
     int32_t ldc,
+    ggml_cuda_pool & pool,  // workspace allocator (pooled, not sync cudaMalloc)
     cudaStream_t stream
 ) {
     if (!A || !B || !alphaRow || !alphaCol || !D) {
@@ -527,7 +564,7 @@ bool matmul_w8a8_cutlass_f32_ptr(
             ElementAccumulator,
             ElementCompute,
             cutlass::arch::OpClassTensorOp,
-            cutlass::arch::Sm80,
+            cutlass::arch::Sm90,  // Hopper (highest arch in CUTLASS 2.x DefaultGemmWithVisitor lineage; Thor sm_110 ran with Sm80 originally, Sm100 has no INT8 specialization in this EVT path)
             TileShape,
             WarpShape,
             cutlass::gemm::GemmShape<16, 8, 32>,
@@ -583,22 +620,25 @@ bool matmul_w8a8_cutlass_f32_ptr(
 
     size_t workspace_size = DeviceGemm::get_workspace_size(arguments);
 
+    // Workspace from the ggml CUDA pool: stream-ordered, no host sync,
+    // released back to the pool when this RAII object goes out of scope.
+    // Replaces the previous per-call cudaMalloc/cudaFree pair.
+    ggml_cuda_pool_alloc<char> workspace_alloc(pool);
     void* workspace = nullptr;
     if (workspace_size > 0) {
-        CUDA_CHECK(cudaMalloc(&workspace, workspace_size));
+        workspace_alloc.alloc(workspace_size);
+        workspace = workspace_alloc.get();
     }
 
     cutlass::Status status;
 
     status = gemm_op.can_implement(arguments);
     if (status != cutlass::Status::kSuccess) {
-        if (workspace) cudaFree(workspace);
         CUTLASS_CHECK(status);
     }
 
     status = gemm_op.initialize(arguments, workspace, stream);
     if (status != cutlass::Status::kSuccess) {
-        if (workspace) cudaFree(workspace);
         CUTLASS_CHECK(status);
     }
 
@@ -614,21 +654,15 @@ bool matmul_w8a8_cutlass_f32_ptr(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUTLASS launch error: %s\n", cudaGetErrorString(err));
-        if (workspace) cudaFree(workspace);
         return false;
     }
 
     err = cudaStreamSynchronize(stream);
     if (err != cudaSuccess) {
         fprintf(stderr, "CUTLASS runtime error: %s\n", cudaGetErrorString(err));
-        if (workspace) cudaFree(workspace);
         return false;
     }
 #endif
-
-    if (workspace) {
-        cudaFree(workspace);
-    }
 
     CUTLASS_CHECK(status);
 
@@ -646,6 +680,7 @@ bool matmul_w8a8_cutlass_cuda(
     int N_gemm,
     int K_gemm,
     int32_t ldc,
+    ggml_cuda_pool & pool,
     cudaStream_t stream
 ) {
     using TileShape = cutlass::gemm::GemmShape<128, 128, 64>;
@@ -662,6 +697,9 @@ bool matmul_w8a8_cutlass_cuda(
         N_gemm,
         K_gemm,
         ldc,
+        pool,
         stream
     );
 }
+
+#endif  // CUSTOM_KERNEL_HAVE_CUTLASS

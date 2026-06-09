@@ -33,7 +33,7 @@ custom_kernels/
 | `2` | `amir_v1` | Caches the Q8_0 → INT8 weight conversion per weight tensor. | `exp016` |
 | `3` | `amir_v2` | `amir_v1` + memory-coalesced INT32 → FP32 dequant. **Beats cuBLAS.** | `exp017` |
 | `4` | `amir_v3` | `amir_v2` + eager INT8 conversion at model load (no step-1 spike). **Default. ~27 % faster than cuBLAS.** | `exp018` |
-| `5` | `amir_v4` | **SKELETON.** CUTLASS-fused INT8 GEMM with per-row × per-col scale epilogue (no INT32 buffer, no standalone dequant). Currently falls back to amir_v2's pipeline; see `src/cutlass_improvement.md`. | `exp020` (planned) |
+| `5` | `amir_v4` | **CUTLASS** fused INT8 GEMM with per-row × per-col scale epilogue (no INT32 buffer, no standalone dequant). Implementation by Thai Vu. **Requires `-DCUTLASS_DIR=/path/to/cutlass`.** See `src/amir_v4_implementation.md` (build steps + review) and `src/cutlass_improvement.md` (design). | `exp020` (planned) |
 
 Non-Q8_0 quantized weights (e.g. the Q4_K Mistral text encoder) fall back to
 stock `ggml_cuda_mul_mat_q`, so a full sd-cli run works without `--clip-on-cpu`.
@@ -46,14 +46,37 @@ After `git submodule update --init ggml` (in the parent repo):
 # One-time: apply the dispatch hook to the ggml submodule
 ./custom_kernels/apply_patch.sh
 
-# Configure with CUDA + your chosen variant (default = 3 = amir_v2)
+# Configure with CUDA + your chosen variant (default = 4 = amir_v3)
 mkdir -p build && cd build
-cmake .. -DSD_CUDA=ON -DCUSTOM_KERNEL_VERSION=3
+cmake .. -DSD_CUDA=ON -DCUSTOM_KERNEL_VERSION=4
 cmake --build . --config Release -j
 ```
 
 To switch variants, reconfigure with a different `-DCUSTOM_KERNEL_VERSION=…`
 and rebuild — no source edits required.
+
+### amir_v4 (CUSTOM_KERNEL_VERSION=5) — additional setup
+
+amir_v4 is Thai Vu's CUTLASS fused-epilogue implementation. It requires a
+CUTLASS checkout on the include path:
+
+```bash
+# One-time: clone CUTLASS anywhere you like
+git clone --depth 1 https://github.com/NVIDIA/cutlass.git ~/Desktop/Diffusion/cutlass
+
+# Configure with amir_v4 + CUTLASS:
+cmake .. -DSD_CUDA=ON \
+         -DCUSTOM_KERNEL_VERSION=5 \
+         -DCUTLASS_DIR=$HOME/Desktop/Diffusion/cutlass
+cmake --build . --config Release -j
+```
+
+If `CUTLASS_DIR` is unset (or points somewhere that doesn't contain
+`include/cutlass/cutlass.h`) and `CUSTOM_KERNEL_VERSION=5`, CMake errors
+out with a hint. Variants 1..4 don't need CUTLASS.
+
+See `src/amir_v4_implementation.md` for the technical write-up and review
+notes; `src/cutlass_improvement.md` for the original design.
 
 ## How it's wired into the ggml-cuda library
 

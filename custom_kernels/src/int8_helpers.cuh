@@ -59,13 +59,23 @@ struct cached_int8_weight {
 extern std::unordered_map<const void *, cached_int8_weight> g_amir_int8_weight_cache;
 
 /*
-Function to perform INT8 GEMM + dequantization in one step, using CUTLASS.
+Fused INT8 GEMM + per-row × per-col dequantization → FP32 output (CUTLASS).
+Implementation by Thai Vu — used by amir_v4 (CUSTOM_KERNEL_VERSION=5).
+Only declared when the build was made with CUTLASS (-DCUTLASS_DIR=...).
+
 - A: [M, K], row-major INT8
-- B: [N, K], row-major INT8 
+- B: [N, K], row-major INT8
 - alphaRow: [M] row scales
 - alphaCol: [N] column scales
-- D: [M, N], column-major FP32 output
+- D: [M, N], column-major FP32 output (leading dim ldc)
+
+Epilogue math:  D[m, n] = float(acc_i32[m, n]) * alphaRow[m] * alphaCol[n]
 */
+#if defined(CUSTOM_KERNEL_HAVE_CUTLASS)
+// Forward declaration -- defined in ggml-cuda's common.cuh (transitively included
+// by amir_v4.cu and int8_helpers.cu inside the CUTLASS guard).
+struct ggml_cuda_pool;
+
 bool matmul_w8a8_cutlass_cuda(
     const int8_t* A,                  // [M, K_gemm], row-major
     const int8_t* B,                  // [N_gemm, K_gemm], row-major physical memory
@@ -76,5 +86,7 @@ bool matmul_w8a8_cutlass_cuda(
     int N_gemm,
     int K_gemm,
     int ldc,
+    ggml_cuda_pool & pool,            // ggml CUDA pool for the GEMM workspace
     cudaStream_t stream
 );
+#endif

@@ -1,9 +1,17 @@
-# amir_v4 — CUTLASS Epilogue Fusion (Design Note)
+# amir_v4 — CUTLASS Epilogue Fusion (Original Design Note)
 
-This doc lives next to `amir_v4.cu` and is the technical brief for the colleague
-implementing the CUTLASS variant. It explains the bottleneck we're attacking, why
-stock cuBLAS can't fix it, what CUTLASS gives us, the exact math the epilogue
-needs to apply, and the expected performance impact.
+> **Status.** This doc captures the *design* of amir_v4 that motivated the
+> work. The actual implementation by Thai Vu is documented in
+> **`amir_v4_implementation.md`** (same directory), which describes the EVT
+> epilogue tree, the CUTLASS template parameters chosen, the build wiring
+> (CUTLASS_DIR), and review notes. Read `amir_v4_implementation.md` first if
+> you want to *use* amir_v4; read this doc if you want the *why*.
+
+This doc lives next to `amir_v4.cu` and was originally written as the
+technical brief for the colleague implementing the CUTLASS variant. It
+explains the bottleneck we're attacking, why stock cuBLAS can't fix it,
+what CUTLASS gives us, the exact math the epilogue needs to apply, and the
+expected performance impact.
 
 Cross-reference: the broader project context is in
 `progress.md` (repo root) and `notes/custom_kernel.md`.
