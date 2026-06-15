@@ -23,12 +23,14 @@ endif()
 #   2 = amir_v1  (cached weight conversion;                    exp016)
 #   3 = amir_v2  (cached + coalesced dequant;                  exp017)
 #   4 = amir_v3  (amir_v2 + load-time INT8 weight conversion;  exp018)  [default]
-#   5 = amir_v4  (CUTLASS fused INT8 GEMM + dequant epilogue,
+#   5 = amir_v4  (CUTLASS 2.x EVT fused INT8 GEMM + dequant epilogue, Sm90;
 #                 implementation by Thai Vu — requires CUTLASS_DIR)
+#   6 = amir_v5  (CUTLASS 3.x rewrite of amir_v4 targeting Sm100 / Blackwell
+#                 collective-builder API — requires CUTLASS_DIR)
 # ----------------------------------------------------------------------------
 set(CUSTOM_KERNEL_VERSION "4" CACHE STRING
-    "Custom INT8 kernel variant: 1=thai_vu, 2=amir_v1, 3=amir_v2, 4=amir_v3, 5=amir_v4")
-set_property(CACHE CUSTOM_KERNEL_VERSION PROPERTY STRINGS "1" "2" "3" "4" "5")
+    "Custom INT8 kernel variant: 1=thai_vu, 2=amir_v1, 3=amir_v2, 4=amir_v3, 5=amir_v4, 6=amir_v5")
+set_property(CACHE CUSTOM_KERNEL_VERSION PROPERTY STRINGS "1" "2" "3" "4" "5" "6")
 
 # ----------------------------------------------------------------------------
 # Sources — always compile all variants so swapping is just a recompile of the
@@ -45,6 +47,7 @@ set(CUSTOM_KERNEL_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/src/amir_v1.cu
     ${CMAKE_CURRENT_LIST_DIR}/src/amir_v2.cu
     ${CMAKE_CURRENT_LIST_DIR}/src/amir_v4.cu
+    ${CMAKE_CURRENT_LIST_DIR}/src/amir_v5.cu
     ${CMAKE_CURRENT_LIST_DIR}/src/preload.cu
 )
 
@@ -84,7 +87,7 @@ if (CUTLASS_DIR AND EXISTS "${CUTLASS_DIR}/include/cutlass/cutlass.h")
     )
     target_compile_definitions(ggml-cuda PRIVATE CUSTOM_KERNEL_HAVE_CUTLASS=1)
     message(STATUS "custom_kernels: CUTLASS found at ${CUTLASS_DIR} — amir_v4 enabled")
-elseif (CUSTOM_KERNEL_VERSION GREATER_EQUAL 5)
+elseif (CUSTOM_KERNEL_VERSION GREATER_EQUAL 5)  # amir_v4 (v=5) and amir_v5 (v=6) both need CUTLASS
     message(FATAL_ERROR
         "custom_kernels: CUSTOM_KERNEL_VERSION=${CUSTOM_KERNEL_VERSION} (amir_v4) requires CUTLASS.\n"
         "  Clone CUTLASS:  git clone --depth 1 https://github.com/NVIDIA/cutlass /path/to/cutlass\n"
@@ -102,4 +105,4 @@ if (TARGET stable-diffusion)
 endif()
 
 message(STATUS "custom_kernels: variant=${CUSTOM_KERNEL_VERSION} "
-               "(1=thai_vu, 2=amir_v1, 3=amir_v2, 4=amir_v3, 5=amir_v4[CUTLASS])")
+               "(1=thai_vu, 2=amir_v1, 3=amir_v2, 4=amir_v3, 5=amir_v4[CUTLASS 2.x Sm90], 6=amir_v5[CUTLASS 3.x Sm100])")

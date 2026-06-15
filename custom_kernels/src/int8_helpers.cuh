@@ -89,4 +89,21 @@ bool matmul_w8a8_cutlass_cuda(
     ggml_cuda_pool & pool,            // ggml CUDA pool for the GEMM workspace
     cudaStream_t stream
 );
+
+// amir_v5 — CUTLASS 3.x version of the same fused INT8 GEMM + per-row × per-col
+// dequant epilogue, using the collective::CollectiveBuilder API so we can target
+// Sm100 (Blackwell). Same Arguments interface as the 2.x wrapper above.
+bool matmul_w8a8_cutlass3x_cuda(
+    const int8_t* A,
+    const int8_t* B,
+    const float* alphaRow,
+    const float* alphaCol,
+    float* D,
+    int M,
+    int N_gemm,
+    int K_gemm,
+    int ldc,
+    ggml_cuda_pool & pool,
+    cudaStream_t stream
+);
 #endif

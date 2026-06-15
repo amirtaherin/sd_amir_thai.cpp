@@ -702,4 +702,240 @@ bool matmul_w8a8_cutlass_cuda(
     );
 }
 
+
+// =====================================================================================
+// amir_v5 — same fused INT8 GEMM + per-row × per-col dequant, ported to the
+// CUTLASS 3.x collective API so we can actually target Sm100 (Blackwell). The
+// 2.x DefaultGemmWithVisitor path tops out at Sm90 for INT8 specialisations,
+// which is why amir_v4 left so much performance on the table on Thor (sm_110).
+//
+// EVT structure is identical to amir_v4 (Sm90EVT visitors work for Sm100 in 3.x):
+//   D[m,n] = float(acc[m,n]) * alphaRow[m] * alphaCol[n]
+//
+//                  Sm90EVT< multiply,
+//                          Sm90EVT< multiply, AccFetch, ColBroadcast(alphaRow) >,
+//                          RowBroadcast(alphaCol) >
+//
+// Same Arguments interface as the 2.x wrapper so amir_v5.cu can call it
+// alongside the 2.x one without code-shape changes.
+// =====================================================================================
+
+#include "cutlass/gemm/collective/collective_builder.hpp"
+#include "cutlass/epilogue/collective/collective_builder.hpp"
+#include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/epilogue/fusion/sm90_callbacks_tma_warpspecialized.hpp"
+#include "cutlass/util/packed_stride.hpp"      // cutlass::make_cute_packed_stride
+
+template <typename TileShape, typename ClusterShape>
+bool matmul_w8a8_cutlass3x_f32_ptr(
+    const int8_t* A,
+    const int8_t* B,
+    const float* alphaRow,
+    const float* alphaCol,
+    float* D,
+    int32_t M,
+    int32_t N_gemm,
+    int32_t K_gemm,
+    int32_t ldc,
+    ggml_cuda_pool & pool,
+    cudaStream_t stream
+) {
+    if (!A || !B || !alphaRow || !alphaCol || !D) {
+        fprintf(stderr, "matmul_w8a8_cutlass3x_f32_ptr: null pointer input\n");
+        return false;
+    }
+    if (M <= 0 || N_gemm <= 0 || K_gemm <= 0) {
+        fprintf(stderr, "matmul_w8a8_cutlass3x_f32_ptr: invalid shape\n");
+        return false;
+    }
+    if (ldc < M) {
+        fprintf(stderr,
+                "matmul_w8a8_cutlass3x_f32_ptr: invalid ldc. ldc=%d, M=%d\n", ldc, M);
+        return false;
+    }
+    if (K_gemm % 32 != 0) {
+        fprintf(stderr,
+                "matmul_w8a8_cutlass3x_f32_ptr: K_gemm must be multiple of 32. K_gemm=%d\n",
+                K_gemm);
+        return false;
+    }
+
+    using namespace cute;
+
+    using ElementA            = int8_t;
+    using LayoutA             = cutlass::layout::RowMajor;
+    constexpr int AlignmentA  = 16;
+
+    using ElementB            = int8_t;
+    using LayoutB             = cutlass::layout::ColumnMajor;
+    constexpr int AlignmentB  = 16;
+
+    using ElementOutput       = float;
+    using LayoutC             = cutlass::layout::ColumnMajor;
+    constexpr int AlignmentC  = 4;   // TMA requires 128-bit alignment for FP32 D (128 / 32 = 4)
+
+    using ElementAccumulator  = int32_t;
+    using ElementCompute      = float;
+    using ElementScale        = float;
+
+    using ArchTag             = cutlass::arch::Sm100;
+    using OperatorClass       = cutlass::arch::OpClassTensorOp;
+    using KernelSchedule      = cutlass::gemm::collective::KernelScheduleAuto;
+    using EpilogueSchedule    = cutlass::epilogue::collective::EpilogueScheduleAuto;
+
+    // EVT building blocks (Sm90... ops are reused for Sm100 in CUTLASS 3.x).
+    // The broadcast visitors default to the right stride layout
+    // (Sm90ColBroadcast: Stride<_1,_0,_0>, Sm90RowBroadcast: Stride<_0,_1,_0>),
+    // so we don't need to override StrideMNL_.
+    using AccFetch         = cutlass::epilogue::fusion::Sm90AccFetch;
+
+    using RowScaleBroadcast = cutlass::epilogue::fusion::Sm90ColBroadcast<
+        /* Stages = */ 0,
+        TileShape,
+        ElementScale>;
+
+    using ColScaleBroadcast = cutlass::epilogue::fusion::Sm90RowBroadcast<
+        /* Stages = */ 0,
+        TileShape,
+        ElementScale>;
+
+    using ComputeMul = cutlass::epilogue::fusion::Sm90Compute<
+        cutlass::multiplies,
+        ElementCompute,
+        ElementCompute,
+        cutlass::FloatRoundStyle::round_to_nearest>;
+
+    using EVTRowScale = cutlass::epilogue::fusion::Sm90EVT<
+        ComputeMul,
+        AccFetch,
+        RowScaleBroadcast>;
+
+    using EVTRowColScale = cutlass::epilogue::fusion::Sm90EVT<
+        ComputeMul,
+        EVTRowScale,
+        ColScaleBroadcast>;
+
+    using FusionCallbacks = EVTRowColScale;
+
+    using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        ArchTag, OperatorClass,
+        TileShape, ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator, ElementCompute,
+        void, LayoutC, AlignmentC,            // C source — unused
+        ElementOutput, LayoutC, AlignmentC,   // D output
+        EpilogueSchedule,
+        FusionCallbacks
+    >::CollectiveOp;
+
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        ArchTag, OperatorClass,
+        ElementA, LayoutA, AlignmentA,
+        ElementB, LayoutB, AlignmentB,
+        ElementAccumulator,
+        TileShape, ClusterShape,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        KernelSchedule
+    >::CollectiveOp;
+
+    using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+        cute::Shape<int, int, int, int>,
+        CollectiveMainloop,
+        CollectiveEpilogue
+    >;
+
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    // EVT arguments — Sm90EVT Args layout is { child0_args, child1_args, ..., op_args }
+    // (op args come LAST, after all children — see example 71).
+    //
+    //   EVTRowColScale = Sm90EVT< ComputeMul, EVTRowScale, ColScaleBroadcast >
+    //     EVTRowScale  = Sm90EVT< ComputeMul, AccFetch, RowScaleBroadcast >
+    //
+    // Broadcast Arguments struct: { ptr, null_default, StrideMNL = {} } —
+    // default stride is fine; CUTLASS infers the broadcast pattern.
+    typename FusionCallbacks::Arguments fusion_args{
+        // EVTRowScale: { AccFetch args, RowScaleBroadcast args, ComputeMul args }
+        {
+            {},                                          // AccFetch (empty)
+            { alphaRow, ElementScale(0), {} },           // RowScaleBroadcast
+            {}                                           // ComputeMul (inner)
+        },
+        { alphaCol, ElementScale(0), {} },               // ColScaleBroadcast (outer child 1)
+        {}                                               // ComputeMul (outer)
+    };
+
+    // Strides built via the canonical helper. Layouts come from the kernel's own
+    // StrideA / StrideB / StrideD type aliases — that way we always match what
+    // the collective builder expects (whatever the layout transformations decided).
+    using StrideA_t = typename GemmKernel::StrideA;
+    using StrideB_t = typename GemmKernel::StrideB;
+    using StrideC_t = typename GemmKernel::StrideC;
+    using StrideD_t = typename GemmKernel::StrideD;
+    auto stride_A = cutlass::make_cute_packed_stride(StrideA_t{}, cute::make_shape(M, K_gemm, 1));
+    auto stride_B = cutlass::make_cute_packed_stride(StrideB_t{}, cute::make_shape(N_gemm, K_gemm, 1));
+    auto stride_D = cutlass::make_cute_packed_stride(StrideD_t{}, cute::make_shape(M, N_gemm, 1));
+    StrideC_t stride_C{};  // C is unused (nullptr source)
+
+    typename Gemm::Arguments arguments{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        { M, N_gemm, K_gemm, 1 },
+        {
+            A, stride_A,
+            B, stride_B,
+        },
+        {
+            fusion_args,
+            nullptr, stride_C,   // C source unused
+            D,       stride_D,
+        }
+    };
+
+    Gemm gemm_op;
+
+    size_t workspace_size = Gemm::get_workspace_size(arguments);
+
+    ggml_cuda_pool_alloc<char> workspace_alloc(pool);
+    void* workspace = nullptr;
+    if (workspace_size > 0) {
+        workspace_alloc.alloc(workspace_size);
+        workspace = workspace_alloc.get();
+    }
+
+    cutlass::Status status;
+    status = gemm_op.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) CUTLASS_CHECK(status);
+
+    status = gemm_op.initialize(arguments, workspace, stream);
+    if (status != cutlass::Status::kSuccess) CUTLASS_CHECK(status);
+
+    status = gemm_op.run(stream);
+    CUTLASS_CHECK(status);
+
+    return true;
+}
+
+
+bool matmul_w8a8_cutlass3x_cuda(
+    const int8_t* A,
+    const int8_t* B,
+    const float* alphaRow,
+    const float* alphaCol,
+    float* D,
+    int M,
+    int N_gemm,
+    int K_gemm,
+    int32_t ldc,
+    ggml_cuda_pool & pool,
+    cudaStream_t stream
+) {
+    using TileShape    = cute::Shape<cute::_128, cute::_128, cute::_128>;
+    using ClusterShape = cute::Shape<cute::_1,   cute::_1,   cute::_1>;
+
+    return matmul_w8a8_cutlass3x_f32_ptr<TileShape, ClusterShape>(
+        A, B, alphaRow, alphaCol, D,
+        M, N_gemm, K_gemm, ldc, pool, stream);
+}
+
 #endif  // CUSTOM_KERNEL_HAVE_CUTLASS
