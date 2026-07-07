@@ -62,14 +62,22 @@ void quantize_f32_to_int4_row_wise_cuda(
     cudaStream_t stream
 );
 
-bool block_fwht_sign_rotate_rows_cuda(
+bool block_fwht_rotate_rows_inplace_cuda(
     float * x,
     int rows,
     int K,
     cudaStream_t stream
 );
 
-void compute_src1_incoherence_score_cuda(
+bool block_fwht_rotate_rows_cuda(
+    const float * x_in,
+    float * x_out,
+    int rows,
+    int K,
+    cudaStream_t stream
+);
+
+void compute_incoherence_score_cuda(
     const float * src1_ddf_i,
     float * score_device,
     int64_t N,
@@ -78,3 +86,29 @@ void compute_src1_incoherence_score_cuda(
 );
 
 float get_quantization_incoherent_threshold();
+
+
+static inline int get_incoherence_num_blocks(int64_t numel) {
+    constexpr int BLOCK_SIZE = 256;
+
+    int num_blocks = (int)((numel + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+    // Avoid launching too many blocks.
+    num_blocks = std::min(num_blocks, 4096);
+
+    // At least one block.
+    num_blocks = std::max(num_blocks, 1);
+
+    return num_blocks;
+};
+
+void compute_incoherence_score_cuda_fast(
+    const float * src1_ddf_i,
+    float * score_device,
+    float * partial_max_abs,
+    float * partial_sum_sq,
+    int64_t N,
+    int64_t K,
+    int num_blocks,
+    cudaStream_t stream
+) ;

@@ -87,11 +87,9 @@ __global__ void convert_q4_0_to_int4_row_wise_kernel(
     constexpr int qk = QK4_0;
     const int blocks_per_row = K / qk;
 
-    const block_q4_0 * blocks =
-        reinterpret_cast<const block_q4_0 *>(src_q4);
+    const block_q4_0 * blocks = reinterpret_cast<const block_q4_0 *>(src_q4);
 
-    const block_q4_0 * row_blocks =
-        blocks + row * blocks_per_row;
+    const block_q4_0 * row_blocks = blocks + row * blocks_per_row;
 
     __shared__ float smem[BLOCK_SIZE];
 
@@ -192,6 +190,7 @@ __global__ void convert_q4_0_to_int4_row_wise_kernel(
         dst_i4_packed[row * packed_K + p] = pack_s4_pair(q0, q1);
     }
 }
+
 
 void convert_q4_0_to_int4_row_wise_cuda(
     const char * src_q4,
@@ -427,6 +426,7 @@ static __device__ __forceinline__ int q4_0_get_signed_value(uint8_t byte, int wi
     return q_u4 - 8;
 }
 
+
 template<int BLOCK_SIZE>
 __global__ void convert_q4_0_to_int8_row_wise_kernel(
     const char * __restrict__ src_q4,
@@ -545,21 +545,6 @@ void convert_q4_0_to_int8_row_wise_cuda(
         );
 }
 
-static __device__ __forceinline__ int q4_0_unpack_signed(uint8_t byte, int within_block) {
-    int q_u4;
-
-    // GGML Q4_0 block layout:
-    // low  nibbles -> elements 0..15
-    // high nibbles -> elements 16..31
-    if (within_block < 16) {
-        q_u4 = byte & 0x0f;
-    } else {
-        q_u4 = (byte >> 4) & 0x0f;
-    }
-
-    return q_u4 - 8;
-}
-
 
 static __device__ __forceinline__ int spin_sign(int k, int seed) {
     uint32_t x = static_cast<uint32_t>(k) ^ static_cast<uint32_t>(seed);
@@ -574,6 +559,7 @@ static __device__ __forceinline__ int spin_sign(int k, int seed) {
 
     return (x & 1U) ? 1 : -1;
 }
+
 
 template<int BLOCK_SIZE>
 __global__ void dequantize_q4_0_to_f32_kernel(
@@ -604,7 +590,7 @@ __global__ void dequantize_q4_0_to_f32_kernel(
         const block_q4_0 * blk = &row_blocks[block_id];
 
         uint8_t byte = static_cast<uint8_t>(blk->qs[byte_id]);
-        int q_s4 = q4_0_unpack_signed(byte, within);
+        int q_s4 = q4_0_get_signed_value(byte, within);
 
         float d = ggml_fp16_to_fp32_kernel(blk->d);
 
@@ -716,12 +702,10 @@ void quantize_f32_to_int4_row_wise_cuda(
 }
 
 template<int BLOCK_SIZE, int BLOCK_H>
-__global__ void block_fwht_sign_rotate_rows_kernel(
+__global__ void block_fwht_rotate_rows_inplace_kernel(
     float * __restrict__ x,
     int rows,
-    int K,
-    int seed1,
-    int seed2
+    int K
 ) {
     const int row = blockIdx.x;
     const int block_h_id = blockIdx.y;
@@ -741,21 +725,17 @@ __global__ void block_fwht_sign_rotate_rows_kernel(
     float * x_row = x + row * K;
 
     // ------------------------------------------------------------
-    // Load one K-block + first sign flip
+    // Load one K-block
     // ------------------------------------------------------------
     for (int i = threadIdx.x; i < BLOCK_H; i += BLOCK_SIZE) {
         const int k = base_k + i;
-
-        float v = x_row[k];
-        int s1 = spin_sign(k, seed1);
-
-        smem[i] = v * static_cast<float>(s1);
+        smem[i] = x_row[k];
     }
 
     __syncthreads();
 
     // ------------------------------------------------------------
-    // In-place FWHT inside this block
+    // In-place FWHT inside shared memory
     // ------------------------------------------------------------
     for (int len = 1; len < BLOCK_H; len <<= 1) {
         for (int i = threadIdx.x; i < BLOCK_H; i += BLOCK_SIZE) {
@@ -776,18 +756,15 @@ __global__ void block_fwht_sign_rotate_rows_kernel(
     const float norm = rsqrtf(static_cast<float>(BLOCK_H));
 
     // ------------------------------------------------------------
-    // Normalize + second sign flip + store back
+    // Normalize + store back
     // ------------------------------------------------------------
     for (int i = threadIdx.x; i < BLOCK_H; i += BLOCK_SIZE) {
         const int k = base_k + i;
-
-        int s2 = spin_sign(k, seed2);
-
-        x_row[k] = smem[i] * norm * static_cast<float>(s2);
+        x_row[k] = smem[i] * norm;
     }
 }
 
-bool block_fwht_sign_rotate_rows_cuda(
+bool block_fwht_rotate_rows_inplace_cuda(
     float * x,
     int rows,
     int K,
@@ -800,24 +777,159 @@ bool block_fwht_sign_rotate_rows_cuda(
         return false;
     }
 
-    const int seed1 = 1234;
-    const int seed2 = 5678;
-
     dim3 grid(rows, K / BLOCK_H);
     dim3 block(BLOCK_SIZE);
 
-    block_fwht_sign_rotate_rows_kernel<BLOCK_SIZE, BLOCK_H>
+    block_fwht_rotate_rows_inplace_kernel<BLOCK_SIZE, BLOCK_H>
         <<<grid, block, 0, stream>>>(
             x,
             rows,
-            K,
-            seed1,
-            seed2
+            K
         );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error in block_fwht_rotate_rows_inplace_cuda: %s\n",
+                cudaGetErrorString(err));
+        return false;
+    }
 
     return true;
 }
 
+
+template<int BLOCK_SIZE, int BLOCK_H>
+__global__ void block_fwht_rotate_rows_kernel(
+    const float * __restrict__ x_in,
+    float * __restrict__ x_out,
+    int rows,
+    int K
+) {
+    const int row = blockIdx.x;
+    const int block_h_id = blockIdx.y;
+
+    if (row >= rows) {
+        return;
+    }
+
+    const int base_k = block_h_id * BLOCK_H;
+
+    if (base_k + BLOCK_H > K) {
+        return;
+    }
+
+    __shared__ float smem[BLOCK_H];
+
+    const float * x_in_row = x_in + row * K;
+    float * x_out_row = x_out + row * K;
+
+    // ------------------------------------------------------------
+    // Load one K-block from input
+    // ------------------------------------------------------------
+    for (int i = threadIdx.x; i < BLOCK_H; i += BLOCK_SIZE) {
+        const int k = base_k + i;
+        smem[i] = x_in_row[k];
+    }
+
+    __syncthreads();
+
+    // ------------------------------------------------------------
+    // In-place FWHT inside shared memory
+    // ------------------------------------------------------------
+    for (int len = 1; len < BLOCK_H; len <<= 1) {
+        for (int i = threadIdx.x; i < BLOCK_H; i += BLOCK_SIZE) {
+            const int j = i ^ len;
+
+            if ((i & len) == 0) {
+                float a = smem[i];
+                float b = smem[j];
+
+                smem[i] = a + b;
+                smem[j] = a - b;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    const float norm = rsqrtf(static_cast<float>(BLOCK_H));
+
+    // ------------------------------------------------------------
+    // Normalize + store to output
+    // ------------------------------------------------------------
+    for (int i = threadIdx.x; i < BLOCK_H; i += BLOCK_SIZE) {
+        const int k = base_k + i;
+        x_out_row[k] = smem[i] * norm;
+    }
+}
+
+bool block_fwht_rotate_rows_cuda(
+    const float * x_in,
+    float * x_out,
+    int rows,
+    int K,
+    cudaStream_t stream
+) {
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int BLOCK_H    = 256;
+
+    if (x_in == x_out) {
+        fprintf(stderr, "block_fwht_rotate_rows_cuda: x_in and x_out must be different pointers\n");
+        return false;
+    }
+
+    if (K % BLOCK_H != 0) {
+        return false;
+    }
+
+    dim3 grid(rows, K / BLOCK_H);
+    dim3 block(BLOCK_SIZE);
+
+    block_fwht_rotate_rows_kernel<BLOCK_SIZE, BLOCK_H>
+        <<<grid, block, 0, stream>>>(
+            x_in,
+            x_out,
+            rows,
+            K
+        );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error in block_fwht_rotate_rows_out_cuda: %s\n",
+                cudaGetErrorString(err));
+        return false;
+    }
+
+    return true;
+}
+
+
+// =============================================================================
+/*
+Below is code to compute the incoherence score of a tensor on CUDA. Basically, we have two version.
+
+Version 1: compute_incoherence_kernel and compute_incoherence_score_cuda. 
+- This version is simple and straightforward.
+- But, it is slow. 
+
+Version 2: compute_incoherence_score_cuda_fast
+- This version is more complex, but it is faster. It uses a two-pass approach to compute the incoherence score.
+*/
+// ==============================================================================
+
+float get_quantization_incoherent_threshold() {
+    // Default incoherent  is 10.0f
+    const char * env = std::getenv("QUANTIZATION_INCOHERENT_THRESHOLD");
+    if (env != nullptr) {
+        try {
+            float threshold = std::stof(env);
+            return threshold;
+        } catch (const std::exception & e) {    
+            fprintf(stderr, "Warning: Invalid value for QUANTIZATION_INCOHERENT_THRESHOLD: %s\n", env);
+        }
+    } 
+    return 10.0f;
+}
 
 template<int BLOCK_SIZE>
 __global__ void compute_incoherence_kernel(
@@ -865,7 +977,8 @@ __global__ void compute_incoherence_kernel(
     }
 }
 
-void compute_src1_incoherence_score_cuda(
+
+void compute_incoherence_score_cuda(
     const float * src1_ddf_i,
     float * score_device,
     int64_t N,
@@ -885,22 +998,168 @@ void compute_src1_incoherence_score_cuda(
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        fprintf(stderr, "CUDA error in compute_src1_incoherence_score_cuda: %s\n",
+        fprintf(stderr, "CUDA error in compute_incoherence_score_cuda: %s\n",
                 cudaGetErrorString(err));
         return;
     }
 }
 
-float get_quantization_incoherent_threshold() {
-    // Default incoherent  is 10.0f
-    const char * env = std::getenv("QUANTIZATION_INCOHERENT_THRESHOLD");
-    if (env != nullptr) {
-        try {
-            float threshold = std::stof(env);
-            return threshold;
-        } catch (const std::exception & e) {    
-            fprintf(stderr, "Warning: Invalid value for QUANTIZATION_INCOHERENT_THRESHOLD: %s\n", env);
+
+template<int BLOCK_SIZE>
+__device__ __forceinline__ void block_reduce_max_sum(
+    float & local_max_abs,
+    float & local_sum_sq,
+    float * smem_max_abs,
+    float * smem_sum_sq
+) {
+    const int tid = threadIdx.x;
+
+    smem_max_abs[tid] = local_max_abs;
+    smem_sum_sq[tid]  = local_sum_sq;
+
+    __syncthreads();
+
+    for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem_max_abs[tid] = fmaxf(
+                smem_max_abs[tid],
+                smem_max_abs[tid + s]
+            );
+
+            smem_sum_sq[tid] += smem_sum_sq[tid + s];
         }
-    } 
-    return 10.0f;
+
+        __syncthreads();
+    }
+
+    local_max_abs = smem_max_abs[0];
+    local_sum_sq  = smem_sum_sq[0];
+}
+
+
+template<int BLOCK_SIZE>
+__global__ void compute_incoherence_partial_kernel(
+    const float * __restrict__ x,
+    float * __restrict__ partial_max_abs,
+    float * __restrict__ partial_sum_sq,
+    int64_t numel
+) {
+    const int tid = threadIdx.x;
+
+    __shared__ float smem_max_abs[BLOCK_SIZE];
+    __shared__ float smem_sum_sq[BLOCK_SIZE];
+
+    float local_max_abs = 0.0f;
+    float local_sum_sq  = 0.0f;
+
+    const int64_t global_tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride     = (int64_t)blockDim.x * gridDim.x;
+
+    for (int64_t i = global_tid; i < numel; i += stride) {
+        float v = x[i];
+        float av = fabsf(v);
+
+        local_max_abs = fmaxf(local_max_abs, av);
+        local_sum_sq += v * v;
+    }
+
+    block_reduce_max_sum<BLOCK_SIZE>(
+        local_max_abs,
+        local_sum_sq,
+        smem_max_abs,
+        smem_sum_sq
+    );
+
+    if (tid == 0) {
+        partial_max_abs[blockIdx.x] = local_max_abs;
+        partial_sum_sq[blockIdx.x]  = local_sum_sq;
+    }
+}
+
+template<int BLOCK_SIZE>
+__global__ void compute_incoherence_final_kernel(
+    const float * __restrict__ partial_max_abs,
+    const float * __restrict__ partial_sum_sq,
+    float * __restrict__ score_out,
+    int num_blocks,
+    int64_t numel
+) {
+    const int tid = threadIdx.x;
+
+    __shared__ float smem_max_abs[BLOCK_SIZE];
+    __shared__ float smem_sum_sq[BLOCK_SIZE];
+
+    float local_max_abs = 0.0f;
+    float local_sum_sq  = 0.0f;
+
+    for (int i = tid; i < num_blocks; i += BLOCK_SIZE) {
+        local_max_abs = fmaxf(local_max_abs, partial_max_abs[i]);
+        local_sum_sq += partial_sum_sq[i];
+    }
+
+    block_reduce_max_sum<BLOCK_SIZE>(
+        local_max_abs,
+        local_sum_sq,
+        smem_max_abs,
+        smem_sum_sq
+    );
+
+    if (tid == 0) {
+        float max_abs = local_max_abs;
+        float rms = sqrtf(local_sum_sq / (float) numel);
+        float eps = 1.0e-12f;
+
+        score_out[0] = max_abs / fmaxf(rms, eps);
+    }
+}
+
+void compute_incoherence_score_cuda_fast(
+    const float * src1_ddf_i,
+    float * score_device,
+    float * partial_max_abs,
+    float * partial_sum_sq,
+    int64_t N,
+    int64_t K,
+    int num_blocks,
+    cudaStream_t stream
+) {
+    constexpr int BLOCK_SIZE = 256;
+
+    const int64_t numel = N * K;
+
+    if (numel <= 0) {
+        cudaMemsetAsync(score_device, 0, sizeof(float), stream);
+        return;
+    }
+
+    compute_incoherence_partial_kernel<BLOCK_SIZE>
+        <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+            src1_ddf_i,
+            partial_max_abs,
+            partial_sum_sq,
+            numel
+        );
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error in compute_incoherence_partial_kernel: %s\n",
+                cudaGetErrorString(err));
+        return;
+    }
+
+    compute_incoherence_final_kernel<BLOCK_SIZE>
+        <<<1, BLOCK_SIZE, 0, stream>>>(
+            partial_max_abs,
+            partial_sum_sq,
+            score_device,
+            num_blocks,
+            numel
+        );
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error in compute_incoherence_final_kernel: %s\n",
+                cudaGetErrorString(err));
+        return;
+    }
 }

@@ -1,66 +1,8 @@
-
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/common.cuh"
-#include "ggml-cuda/acc.cuh"
-#include "ggml-cuda/add-id.cuh"
-#include "ggml-cuda/arange.cuh"
-#include "ggml-cuda/argmax.cuh"
-#include "ggml-cuda/argsort.cuh"
-#include "ggml-cuda/binbcast.cuh"
-#include "ggml-cuda/clamp.cuh"
-#include "ggml-cuda/concat.cuh"
-#include "ggml-cuda/conv-transpose-1d.cuh"
-#include "ggml-cuda/conv2d.cuh"
-#include "ggml-cuda/conv2d-dw.cuh"
-#include "ggml-cuda/conv2d-transpose.cuh"
-#include "ggml-cuda/convert.cuh"
-#include "ggml-cuda/count-equal.cuh"
-#include "ggml-cuda/cpy.cuh"
-#include "ggml-cuda/cross-entropy-loss.cuh"
-#include "ggml-cuda/cumsum.cuh"
-#include "ggml-cuda/diagmask.cuh"
-#include "ggml-cuda/diag.cuh"
-#include "ggml-cuda/fattn.cuh"
-#include "ggml-cuda/getrows.cuh"
-#include "ggml-cuda/im2col.cuh"
-#include "ggml-cuda/mmf.cuh"
-#include "ggml-cuda/mmq.cuh"
-#include "ggml-cuda/mmvf.cuh"
-#include "ggml-cuda/mmvq.cuh"
-#include "ggml-cuda/norm.cuh"
-#include "ggml-cuda/opt-step-adamw.cuh"
-#include "ggml-cuda/opt-step-sgd.cuh"
-#include "ggml-cuda/out-prod.cuh"
-#include "ggml-cuda/pad.cuh"
-#include "ggml-cuda/pool2d.cuh"
-#include "ggml-cuda/quantize.cuh"
-#include "ggml-cuda/rope.cuh"
-#include "ggml-cuda/roll.cuh"
-#include "ggml-cuda/scale.cuh"
-#include "ggml-cuda/softcap.cuh"
-#include "ggml-cuda/softmax.cuh"
-#include "ggml-cuda/ssm-conv.cuh"
-#include "ggml-cuda/ssm-scan.cuh"
-#include "ggml-cuda/sum.cuh"
-#include "ggml-cuda/sumrows.cuh"
-#include "ggml-cuda/top-k.cuh"
-#include "ggml-cuda/mean.cuh"
-#include "ggml-cuda/tsembd.cuh"
-#include "ggml-cuda/topk-moe.cuh"
-#include "ggml-cuda/unary.cuh"
-#include "ggml-cuda/upscale.cuh"
-#include "ggml-cuda/wkv.cuh"
-#include "ggml-cuda/gla.cuh"
-#include "ggml-cuda/set.cuh"
-#include "ggml-cuda/set-rows.cuh"
-#include "ggml-cuda/pad_reflect_1d.cuh"
-#include "ggml-cuda/solve_tri.cuh"
-#include "ggml-cuda/tri.cuh"
-#include "ggml-cuda/cumsum.cuh"
-#include "ggml-cuda/fill.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -84,8 +26,8 @@
 #include <vector>
 #include <unordered_set>
 
+#include "ggml-cuda-int8.cuh"
 #include "ggml-cuda-int4.cuh"
-
 
 /*
 The kernel custom_ggml_q4_kernel_naive is a naive implementation of INT4 matmul, where:
@@ -349,6 +291,66 @@ static void custom_ggml_q4_weight_q8_compute_kernel(
 }
 
 
+static float compute_incoherence_score_wrapper(
+    ggml_backend_cuda_context & ctx,
+    int id,
+    const float * src1_ddf_i,
+    int64_t N,
+    int64_t K,
+    cudaStream_t stream
+) {
+    const int64_t numel = N * K;
+
+    // ------------------------------------------------------------
+    // Allocate output score on device
+    // ------------------------------------------------------------
+    ggml_cuda_pool_alloc<float> score_device(ctx.pool(id));
+    score_device.alloc(1);
+
+    // ------------------------------------------------------------
+    // Allocate temporary partial buffers
+    // ------------------------------------------------------------
+    int num_blocks = get_incoherence_num_blocks(numel);
+
+    ggml_cuda_pool_alloc<float> partial_max_abs(ctx.pool(id));
+    ggml_cuda_pool_alloc<float> partial_sum_sq(ctx.pool(id));
+
+    partial_max_abs.alloc(num_blocks);
+    partial_sum_sq.alloc(num_blocks);
+
+    // ------------------------------------------------------------
+    // Compute score on GPU
+    // ------------------------------------------------------------
+    compute_incoherence_score_cuda_fast(
+        src1_ddf_i,
+        score_device.get(),
+        partial_max_abs.get(),
+        partial_sum_sq.get(),
+        N,
+        K,
+        num_blocks,
+        stream
+    );
+
+    // ------------------------------------------------------------
+    // Copy score back to host
+    // ------------------------------------------------------------
+    float score = 0.0f;
+
+    CUDA_CHECK(cudaMemcpyAsync(
+        &score,
+        score_device.get(),
+        sizeof(float),
+        cudaMemcpyDeviceToHost,
+        stream
+    ));
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    return score;
+}
+
+
 /*
 custom_ggml_q4_kernel_spin is a custom Q4_0-weight matmul path.
 
@@ -386,13 +388,13 @@ void custom_ggml_q4_kernel_spin(
     const int64_t src1_padded_row_size,
     cudaStream_t stream
 ) {
-    GGML_ASSERT(src0->type == GGML_TYPE_Q4_0);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-
     // printf("[DEBUG]: My Custom int4 Kernel\n");
     // print_ggml_tensor_info(src0, "src0");
     // print_ggml_tensor_info(src1, "src1");
     // print_ggml_tensor_info(dst, "dst");
+
+    GGML_ASSERT(src0->type == GGML_TYPE_Q4_0);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
     GGML_ASSERT(src0_dd_i  != nullptr);
     GGML_ASSERT(src1_ddf_i != nullptr);
@@ -423,31 +425,19 @@ void custom_ggml_q4_kernel_spin(
     If the score is above a threshold, we will use the INT8 computation kernel.
     Otherwise, we will use the INT4 + Rotation kernel.
     */
-    ggml_cuda_pool_alloc<float> score_device(ctx.pool(id));
-    score_device.alloc(1);
-
-    compute_src1_incoherence_score_cuda(
+    float score = compute_incoherence_score_wrapper(
+        ctx,
+        id,
         src1_ddf_i,
-        score_device.get(),
         N,
         K,
         stream
     );
 
-    // Copy the score back to host 
-    float score = 0.0f;
-    CUDA_CHECK(cudaMemcpyAsync(
-        &score,
-        score_device.get(),
-        sizeof(float),
-        cudaMemcpyDeviceToHost,
-        stream
-    ));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
     float threshold_q4_score = get_quantization_incoherent_threshold();
     if (score > threshold_q4_score) {
         // Fallback to the INT8 kernel if the incoherence score is larger than threshold
+        printf("[DEBUG]: Incoherence score %.6f > threshold %.6f, using INT8 kernel\n", score, threshold_q4_score);
         custom_ggml_q4_weight_q8_compute_kernel(
             ctx,
             src0,
@@ -469,6 +459,7 @@ void custom_ggml_q4_kernel_spin(
     const int SPIN_BLOCK_H = 256;
     if (K % SPIN_BLOCK_H != 0) {
         // Fallback to the INT8 kernel if K is not divisible by SPIN_BLOCK_H
+        printf("[DEBUG]: K %% SPIN_BLOCK_H != 0, using INT8 kernel\n");
         custom_ggml_q4_weight_q8_compute_kernel(
             ctx,
             src0,
@@ -486,6 +477,7 @@ void custom_ggml_q4_kernel_spin(
         );
         return;
     }
+    printf("[DEBUG] Using INT4 + Rotation kernel. ");
 
     /*
         SpinQuant-style rotation for this layout:
@@ -519,29 +511,22 @@ void custom_ggml_q4_kernel_spin(
     // ------------------------------------------------------------
     // Step 2: copy src1 F32 -> FP32 temp
     // ------------------------------------------------------------
-    ggml_cuda_pool_alloc<float> src1_f32_rot(ctx.pool(id));
-    src1_f32_rot.alloc(N * K);
-
-    CUDA_CHECK(cudaMemcpyAsync(
-        src1_f32_rot.get(),
-        src1_ddf_i,
-        N * K * sizeof(float),
-        cudaMemcpyDeviceToDevice,
-        stream
-    ));
+    ggml_cuda_pool_alloc<float> src1_f32(ctx.pool(id));
+    src1_f32.alloc(N * K);
 
     // ------------------------------------------------------------
     // Step 3: apply same orthogonal rotation to both FP32 matrices
     // ------------------------------------------------------------
-    bool rotate_src0 = block_fwht_sign_rotate_rows_cuda(
+    bool rotate_src0 = block_fwht_rotate_rows_inplace_cuda(
         src0_f32.get(),
         row_diff,
         K,
         stream
     );
 
-    bool rotate_src1 = block_fwht_sign_rotate_rows_cuda(
-        src1_f32_rot.get(),
+    bool rotate_src1 = block_fwht_rotate_rows_cuda(
+        src1_ddf_i,
+        src1_f32.get(),
         N,
         K,
         stream
@@ -578,7 +563,7 @@ void custom_ggml_q4_kernel_spin(
     );
 
     quantize_f32_to_int4_row_wise_cuda(
-        src1_f32_rot.get(),
+        src1_f32.get(),
         src1_as_i4.get(),
         src1_scales.get(),
         N,
@@ -621,4 +606,3 @@ void custom_ggml_q4_kernel_spin(
 
     GGML_UNUSED_VARS(dst, src1_ddq_i, src1_padded_row_size, M);
 }
-
