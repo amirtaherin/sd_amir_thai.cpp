@@ -26,7 +26,10 @@
 #include <vector>
 #include <unordered_set>
 
-#include "ggml-cuda-int8.cuh"
+// Local naming: Thai Vu's tree calls it ggml-cuda-int8.cuh; ours is int8_helpers.cuh.
+// Both expose matmul_w8a8_cutlass_cuda + convert_q4_0_to_int8_row_wise_cuda +
+// quantize_fp32_to_int8_row_wise_cuda + dequantize_i32_to_f32_cuda.
+#include "int8_helpers.cuh"
 #include "ggml-cuda-int4.cuh"
 
 /*
@@ -272,6 +275,9 @@ static void custom_ggml_q4_weight_q8_compute_kernel(
     // ------------------------------------------------------------
     // Step 3 + 4: INT8 GEMM with fused dequantization to FP32
     // ------------------------------------------------------------
+    // Note: matmul_w8a8_cutlass_cuda's signature was extended to take a
+    // ggml_cuda_pool & for its CUTLASS workspace after Thai Vu shipped this
+    // file, so we forward ctx.pool(id) here (see amir_v4.cu for the same call).
     bool matmul_dequant = matmul_w8a8_cutlass_cuda(
         src0_as_i8.get(),    // A: [row_diff, K]
         src1_as_i8.get(),    // B: [N, K]
@@ -282,6 +288,7 @@ static void custom_ggml_q4_weight_q8_compute_kernel(
         N,
         K,
         ldc,
+        ctx.pool(id),        // pool for the CUTLASS workspace
         stream
     );
 

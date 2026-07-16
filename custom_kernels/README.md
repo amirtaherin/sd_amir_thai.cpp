@@ -35,6 +35,35 @@ custom_kernels/
 | `4` | `amir_v3` | `amir_v2` + eager INT8 conversion at model load (no step-1 spike). **Default. ~27 % faster than cuBLAS.** | `exp018` |
 | `5` | `amir_v4` | **CUTLASS** fused INT8 GEMM with per-row × per-col scale epilogue (no INT32 buffer, no standalone dequant). Implementation by Thai Vu. **Requires `-DCUTLASS_DIR=/path/to/cutlass`.** See `src/amir_v4_implementation.md` (build steps + review) and `src/cutlass_improvement.md` (design). | `exp020` (planned) |
 
+## Q4 kernel family (independent of the Q8 family above)
+
+Q4_0 weights get their own separate on/off knob — `CUSTOM_Q4_KERNEL_VERSION`.
+It's independent of `CUSTOM_KERNEL_VERSION`: the two can be combined freely
+(e.g. `CUSTOM_KERNEL_VERSION=6` for Q8 amir_v5 + `CUSTOM_Q4_KERNEL_VERSION=1`
+for Q4 thai_vu_q4 both routed simultaneously). Non-Q8_0 / non-Q4_0 quantized
+weights (e.g. the Q4_K text encoder) still fall through to stock
+`mul_mat_q`, regardless of what these knobs are set to.
+
+| Macro value | Name | Behaviour | Experiment |
+|------------:|------|-----------|------------|
+| `0` | *(disabled)* | Q4_0 weights fall through to stock `mul_mat_q`. Default. | — |
+| `1` | `thai_vu_q4` | **SpinQuant-style FWHT rotation** applied to both weight and activation matrices before INT4 quantization → CUTLASS INT4 GEMM (`i4·i4→i32`) → dequant. Includes a runtime dispatch: if the activation incoherence score exceeds a threshold, falls back to an INT8 GEMM path (`custom_ggml_q4_weight_q8_compute_kernel`) that reuses amir_v4's fused INT8 kernel. Implementation by Thai Vu. **Requires `-DCUTLASS_DIR=/path/to/cutlass`.** See `src/int4_note.md`. | `exp023` |
+
+### Build recipe (Q8 amir_v5 + Q4 thai_vu_q4)
+
+```bash
+# Assumes CUTLASS cloned once at ../cutlass (see submodule .gitignore)
+cmake .. -DSD_CUDA=ON \
+         -DCUSTOM_KERNEL_VERSION=6 \
+         -DCUSTOM_Q4_KERNEL_VERSION=1 \
+         -DCUTLASS_DIR=$PWD/../cutlass \
+         -DCMAKE_CUDA_ARCHITECTURES=110a-real     # Blackwell TMA, needed by v=5/6
+cmake --build . -j
+```
+
+Setting `CUSTOM_Q4_KERNEL_VERSION=0` (or omitting it) disables the Q4 path entirely
+so a stock rebuild of an older revision behaves as it did before.
+
 Non-Q8_0 quantized weights (e.g. the Q4_K Mistral text encoder) fall back to
 stock `ggml_cuda_mul_mat_q`, so a full sd-cli run works without `--clip-on-cpu`.
 

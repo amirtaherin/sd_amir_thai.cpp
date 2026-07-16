@@ -1,8 +1,8 @@
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 08383edb..e1bb46cb 100644
+index 08383edb..2f5e13c3 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -2180,6 +2180,50 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+@@ -2180,6 +2180,66 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
      return use_mul_mat_vec_q;
  }
  
@@ -50,10 +50,26 @@ index 08383edb..e1bb46cb 100644
 +    const int64_t src1_padded_row_size, cudaStream_t stream);
 +#endif
 +
++// =====================================================================================
++// Q4 kernel family — CUSTOM_Q4_KERNEL_VERSION selects which Q4_0-weight matmul we use.
++// Independent of the CUSTOM_KERNEL_VERSION (Q8) family above.
++//   0 = disabled (default) — Q4_0 weights fall through to stock mul_mat_q
++//   1 = thai_vu_q4 (SpinQuant-style FWHT rotation + CUTLASS INT4 GEMM)
++// =====================================================================================
++#if defined(CUSTOM_Q4_KERNEL_VERSION) && (CUSTOM_Q4_KERNEL_VERSION >= 1)
++void custom_ggml_q4_kernel_spin(
++    ggml_backend_cuda_context & ctx,
++    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++    const char * src0_dd_i, const float * src1_ddf_i,
++    const char * src1_ddq_i, float * dst_dd_i,
++    const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
++    const int64_t src1_padded_row_size, cudaStream_t stream);
++#endif
++
  static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
  
-@@ -2249,7 +2293,32 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -2249,7 +2309,45 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
      } else if (!split && use_mul_mat_vec_q) {
          ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
      } else if (!split && use_mul_mat_q) {
@@ -77,7 +93,20 @@ index 08383edb..e1bb46cb 100644
 +#  else
 +#    error "Unknown CUSTOM_KERNEL_VERSION (expected 1..6)"
 +#  endif
-+        } else {
++        }
++#  if defined(CUSTOM_Q4_KERNEL_VERSION) && (CUSTOM_Q4_KERNEL_VERSION >= 1)
++        else if (src0->type == GGML_TYPE_Q4_0 && src1->type == GGML_TYPE_F32) {
++#    if   CUSTOM_Q4_KERNEL_VERSION == 1
++            // thai_vu_q4 — SpinQuant FWHT rotation + CUTLASS INT4 GEMM,
++            // with runtime fallback to INT8 when the activation incoherence
++            // score exceeds a threshold.
++            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, custom_ggml_q4_kernel_spin, nullptr);
++#    else
++#      error "Unknown CUSTOM_Q4_KERNEL_VERSION (expected 0 or 1)"
++#    endif
++        }
++#  endif
++        else {
 +            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
 +        }
 +#else

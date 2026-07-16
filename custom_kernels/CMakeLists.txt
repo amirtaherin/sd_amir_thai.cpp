@@ -70,15 +70,51 @@ target_include_directories(ggml-cuda PRIVATE
 target_compile_definitions(ggml-cuda PRIVATE CUSTOM_KERNEL_VERSION=${CUSTOM_KERNEL_VERSION})
 
 # ----------------------------------------------------------------------------
-# amir_v4 (CUSTOM_KERNEL_VERSION=5) needs CUTLASS. Point at it with
+# Q4 kernel family (thai_vu_q4, Q4_0 weights + FP32 activations).
+#
+#   0 = disabled (default) — Q4_0 weights fall through to stock mul_mat_q.
+#   1 = thai_vu_q4 (SpinQuant-style FWHT rotation + CUTLASS INT4 GEMM, with
+#       runtime fallback to INT8 GEMM when the activation incoherence score
+#       exceeds a threshold — see src/int4_note.md). Requires CUTLASS_DIR.
+#
+# This knob is independent of CUSTOM_KERNEL_VERSION: v=6 (amir_v5) still
+# handles Q8_0 weights, Q4 sets which kernel handles Q4_0 weights.
+#
+# Compile with, e.g.:
+#     cmake .. -DSD_CUDA=ON \
+#              -DCUSTOM_KERNEL_VERSION=6 \
+#              -DCUSTOM_Q4_KERNEL_VERSION=1 \
+#              -DCUTLASS_DIR=/path/to/cutlass \
+#              -DCMAKE_CUDA_ARCHITECTURES=110a-real     # Blackwell TMA (see amir_v5)
+# ----------------------------------------------------------------------------
+set(CUSTOM_Q4_KERNEL_VERSION "0" CACHE STRING
+    "Q4_0 custom kernel: 0=disabled, 1=thai_vu_q4 (SpinQuant + INT4 CUTLASS)")
+set_property(CACHE CUSTOM_Q4_KERNEL_VERSION PROPERTY STRINGS "0" "1")
+
+if (CUSTOM_Q4_KERNEL_VERSION GREATER_EQUAL 1)
+    list(APPEND CUSTOM_KERNEL_SOURCES
+        ${CMAKE_CURRENT_LIST_DIR}/src/ggml-cuda-int4.cu
+        ${CMAKE_CURRENT_LIST_DIR}/src/int4_library.cu
+    )
+    target_sources(ggml-cuda PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}/src/ggml-cuda-int4.cu
+        ${CMAKE_CURRENT_LIST_DIR}/src/int4_library.cu
+    )
+    target_compile_definitions(ggml-cuda PRIVATE
+        CUSTOM_Q4_KERNEL_VERSION=${CUSTOM_Q4_KERNEL_VERSION})
+endif()
+
+# ----------------------------------------------------------------------------
+# CUTLASS: needed by amir_v4 (CUSTOM_KERNEL_VERSION=5), amir_v5 (v=6), and
+# thai_vu_q4 (CUSTOM_Q4_KERNEL_VERSION=1). Point at it with
 #     -DCUTLASS_DIR=/path/to/cutlass-checkout
 # (clone from https://github.com/NVIDIA/cutlass). When CUTLASS_DIR is provided
 # we add its include dir to the ggml-cuda target and define
-# CUSTOM_KERNEL_HAVE_CUTLASS, which gates the CUTLASS code in int8_helpers.cu
-# and the fused-GEMM call in amir_v4.cu. Variants 1..4 build fine without it.
+# CUSTOM_KERNEL_HAVE_CUTLASS, which gates all CUTLASS code paths.
+# Q8 variants 1..4 and Q4 variant 0 build fine without CUTLASS.
 # ----------------------------------------------------------------------------
 set(CUTLASS_DIR "" CACHE PATH
-    "Path to a CUTLASS checkout (https://github.com/NVIDIA/cutlass). Required for CUSTOM_KERNEL_VERSION=5.")
+    "Path to a CUTLASS checkout (https://github.com/NVIDIA/cutlass). Required for CUSTOM_KERNEL_VERSION>=5 or CUSTOM_Q4_KERNEL_VERSION>=1.")
 
 if (CUTLASS_DIR AND EXISTS "${CUTLASS_DIR}/include/cutlass/cutlass.h")
     target_include_directories(ggml-cuda PRIVATE
@@ -86,12 +122,13 @@ if (CUTLASS_DIR AND EXISTS "${CUTLASS_DIR}/include/cutlass/cutlass.h")
         ${CUTLASS_DIR}/tools/util/include   # for cutlass::util::* helpers if used
     )
     target_compile_definitions(ggml-cuda PRIVATE CUSTOM_KERNEL_HAVE_CUTLASS=1)
-    message(STATUS "custom_kernels: CUTLASS found at ${CUTLASS_DIR} — amir_v4 enabled")
-elseif (CUSTOM_KERNEL_VERSION GREATER_EQUAL 5)  # amir_v4 (v=5) and amir_v5 (v=6) both need CUTLASS
+    message(STATUS "custom_kernels: CUTLASS found at ${CUTLASS_DIR}")
+elseif (CUSTOM_KERNEL_VERSION GREATER_EQUAL 5 OR CUSTOM_Q4_KERNEL_VERSION GREATER_EQUAL 1)
     message(FATAL_ERROR
-        "custom_kernels: CUSTOM_KERNEL_VERSION=${CUSTOM_KERNEL_VERSION} (amir_v4) requires CUTLASS.\n"
+        "custom_kernels: CUSTOM_KERNEL_VERSION=${CUSTOM_KERNEL_VERSION} and/or "
+        "CUSTOM_Q4_KERNEL_VERSION=${CUSTOM_Q4_KERNEL_VERSION} requires CUTLASS.\n"
         "  Clone CUTLASS:  git clone --depth 1 https://github.com/NVIDIA/cutlass /path/to/cutlass\n"
-        "  Reconfigure:    cmake .. -DSD_CUDA=ON -DCUSTOM_KERNEL_VERSION=5 -DCUTLASS_DIR=/path/to/cutlass\n"
+        "  Reconfigure:    cmake .. -DSD_CUDA=ON -DCUTLASS_DIR=/path/to/cutlass ...\n"
         "  See custom_kernels/src/amir_v4_implementation.md for the full build flow.")
 endif()
 
@@ -104,5 +141,7 @@ if (TARGET stable-diffusion)
     target_include_directories(stable-diffusion PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
 endif()
 
-message(STATUS "custom_kernels: variant=${CUSTOM_KERNEL_VERSION} "
+message(STATUS "custom_kernels: Q8 variant=${CUSTOM_KERNEL_VERSION} "
                "(1=thai_vu, 2=amir_v1, 3=amir_v2, 4=amir_v3, 5=amir_v4[CUTLASS 2.x Sm90], 6=amir_v5[CUTLASS 3.x Sm100])")
+message(STATUS "custom_kernels: Q4 variant=${CUSTOM_Q4_KERNEL_VERSION} "
+               "(0=disabled, 1=thai_vu_q4[SpinQuant+INT4])")
