@@ -1078,6 +1078,22 @@ public:
         }
 #endif
 
+#if defined(CUSTOM_Q4_KERNEL_VERSION) && (CUSTOM_Q4_KERNEL_VERSION >= 2)
+        // amir_q4_v1: pre-convert all Q4_0 diffusion weights to BOTH rotated
+        // INT4 (SpinQuant path) and plain INT8 (fallback path) at load time,
+        // so the runtime dispatch never pays the per-call conversion cost.
+        if (diffusion_model) {
+            std::map<std::string, struct ggml_tensor *> diffusion_tensors;
+            diffusion_model->get_param_tensors(diffusion_tensors);
+            custom_kernels::preload_q4_0_weights(diffusion_tensors);
+        }
+        if (high_noise_diffusion_model) {
+            std::map<std::string, struct ggml_tensor *> hi_noise_tensors;
+            high_noise_diffusion_model->get_param_tensors(hi_noise_tensors);
+            custom_kernels::preload_q4_0_weights(hi_noise_tensors);
+        }
+#endif
+
         // init denoiser
         {
             prediction_t pred_type = sd_ctx_params->prediction;

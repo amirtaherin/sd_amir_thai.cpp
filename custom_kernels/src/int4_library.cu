@@ -179,7 +179,7 @@ The kernel custom_ggml_q4_weight_q8_compute_kernel take input (src0 and src1) as
 - Quantize src1 F32 -> INT8 + row scales
 - INT8 GEMM + dequantization to FP32.
 */
-static void custom_ggml_q4_weight_q8_compute_kernel(
+void custom_ggml_q4_weight_q8_compute_kernel(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0,
     const ggml_tensor * src1,
@@ -298,7 +298,7 @@ static void custom_ggml_q4_weight_q8_compute_kernel(
 }
 
 
-static float compute_incoherence_score_wrapper(
+float compute_incoherence_score_wrapper(
     ggml_backend_cuda_context & ctx,
     int id,
     const float * src1_ddf_i,

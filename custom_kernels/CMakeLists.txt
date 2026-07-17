@@ -76,6 +76,9 @@ target_compile_definitions(ggml-cuda PRIVATE CUSTOM_KERNEL_VERSION=${CUSTOM_KERN
 #   1 = thai_vu_q4 (SpinQuant-style FWHT rotation + CUTLASS INT4 GEMM, with
 #       runtime fallback to INT8 GEMM when the activation incoherence score
 #       exceeds a threshold — see src/int4_note.md). Requires CUTLASS_DIR.
+#   2 = amir_q4_v1 (thai_vu_q4 with weight caching: rotated INT4 and plain INT8
+#       derivatives of every Q4_0 weight are precomputed at model load and
+#       reused for every matmul. Q4 analog of amir_v3 for Q8). Requires CUTLASS_DIR.
 #
 # This knob is independent of CUSTOM_KERNEL_VERSION: v=6 (amir_v5) still
 # handles Q8_0 weights, Q4 sets which kernel handles Q4_0 weights.
@@ -88,18 +91,23 @@ target_compile_definitions(ggml-cuda PRIVATE CUSTOM_KERNEL_VERSION=${CUSTOM_KERN
 #              -DCMAKE_CUDA_ARCHITECTURES=110a-real     # Blackwell TMA (see amir_v5)
 # ----------------------------------------------------------------------------
 set(CUSTOM_Q4_KERNEL_VERSION "0" CACHE STRING
-    "Q4_0 custom kernel: 0=disabled, 1=thai_vu_q4 (SpinQuant + INT4 CUTLASS)")
-set_property(CACHE CUSTOM_Q4_KERNEL_VERSION PROPERTY STRINGS "0" "1")
+    "Q4_0 custom kernel: 0=disabled, 1=thai_vu_q4, 2=amir_q4_v1 (thai_vu_q4 + weight caching)")
+set_property(CACHE CUSTOM_Q4_KERNEL_VERSION PROPERTY STRINGS "0" "1" "2")
 
 if (CUSTOM_Q4_KERNEL_VERSION GREATER_EQUAL 1)
-    list(APPEND CUSTOM_KERNEL_SOURCES
+    set(_CUSTOM_Q4_SOURCES
         ${CMAKE_CURRENT_LIST_DIR}/src/ggml-cuda-int4.cu
         ${CMAKE_CURRENT_LIST_DIR}/src/int4_library.cu
     )
-    target_sources(ggml-cuda PRIVATE
-        ${CMAKE_CURRENT_LIST_DIR}/src/ggml-cuda-int4.cu
-        ${CMAKE_CURRENT_LIST_DIR}/src/int4_library.cu
-    )
+    if (CUSTOM_Q4_KERNEL_VERSION GREATER_EQUAL 2)
+        # amir_q4_v1: cached-weight matmul entry + load-time preload.
+        list(APPEND _CUSTOM_Q4_SOURCES
+            ${CMAKE_CURRENT_LIST_DIR}/src/amir_q4_v1.cu
+            ${CMAKE_CURRENT_LIST_DIR}/src/preload_q4.cu
+        )
+    endif()
+    list(APPEND CUSTOM_KERNEL_SOURCES ${_CUSTOM_Q4_SOURCES})
+    target_sources(ggml-cuda PRIVATE ${_CUSTOM_Q4_SOURCES})
     target_compile_definitions(ggml-cuda PRIVATE
         CUSTOM_Q4_KERNEL_VERSION=${CUSTOM_Q4_KERNEL_VERSION})
 endif()
@@ -138,10 +146,14 @@ endif()
 # yet (e.g., when this directory is consumed standalone).
 if (TARGET stable-diffusion)
     target_compile_definitions(stable-diffusion PRIVATE CUSTOM_KERNEL_VERSION=${CUSTOM_KERNEL_VERSION})
+    if (CUSTOM_Q4_KERNEL_VERSION GREATER_EQUAL 1)
+        target_compile_definitions(stable-diffusion PRIVATE
+            CUSTOM_Q4_KERNEL_VERSION=${CUSTOM_Q4_KERNEL_VERSION})
+    endif()
     target_include_directories(stable-diffusion PRIVATE ${CMAKE_CURRENT_LIST_DIR}/include)
 endif()
 
 message(STATUS "custom_kernels: Q8 variant=${CUSTOM_KERNEL_VERSION} "
                "(1=thai_vu, 2=amir_v1, 3=amir_v2, 4=amir_v3, 5=amir_v4[CUTLASS 2.x Sm90], 6=amir_v5[CUTLASS 3.x Sm100])")
 message(STATUS "custom_kernels: Q4 variant=${CUSTOM_Q4_KERNEL_VERSION} "
-               "(0=disabled, 1=thai_vu_q4[SpinQuant+INT4])")
+               "(0=disabled, 1=thai_vu_q4[SpinQuant+INT4], 2=amir_q4_v1[thai_vu_q4+cache])")

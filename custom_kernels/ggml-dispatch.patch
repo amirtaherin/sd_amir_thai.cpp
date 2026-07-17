@@ -1,8 +1,8 @@
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 08383edb..2f5e13c3 100644
+index 08383edb..b92c64e7 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -2180,6 +2180,66 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+@@ -2180,6 +2180,75 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
      return use_mul_mat_vec_q;
  }
  
@@ -65,11 +65,20 @@ index 08383edb..2f5e13c3 100644
 +    const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
 +    const int64_t src1_padded_row_size, cudaStream_t stream);
 +#endif
++#if defined(CUSTOM_Q4_KERNEL_VERSION) && (CUSTOM_Q4_KERNEL_VERSION >= 2)
++void custom_ggml_q4_kernel_amir_v1(
++    ggml_backend_cuda_context & ctx,
++    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
++    const char * src0_dd_i, const float * src1_ddf_i,
++    const char * src1_ddq_i, float * dst_dd_i,
++    const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
++    const int64_t src1_padded_row_size, cudaStream_t stream);
++#endif
 +
  static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
  
-@@ -2249,7 +2309,45 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+@@ -2249,7 +2318,50 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
      } else if (!split && use_mul_mat_vec_q) {
          ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
      } else if (!split && use_mul_mat_q) {
@@ -101,8 +110,13 @@ index 08383edb..2f5e13c3 100644
 +            // with runtime fallback to INT8 when the activation incoherence
 +            // score exceeds a threshold.
 +            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, custom_ggml_q4_kernel_spin, nullptr);
++#    elif CUSTOM_Q4_KERNEL_VERSION == 2
++            // amir_q4_v1 — thai_vu_q4 with cached weight derivatives (both
++            // the rotated INT4 and the plain INT8 versions) precomputed at
++            // model load. Q4 analog of amir_v3 for Q8.
++            ggml_cuda_op_mul_mat(ctx, src0, src1, dst, custom_ggml_q4_kernel_amir_v1, nullptr);
 +#    else
-+#      error "Unknown CUSTOM_Q4_KERNEL_VERSION (expected 0 or 1)"
++#      error "Unknown CUSTOM_Q4_KERNEL_VERSION (expected 0, 1, or 2)"
 +#    endif
 +        }
 +#  endif

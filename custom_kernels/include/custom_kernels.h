@@ -21,4 +21,16 @@ namespace custom_kernels {
 // before returning so callers can immediately enqueue matmuls.
 int preload_q8_0_weights(const std::map<std::string, struct ggml_tensor *> & tensors);
 
+// amir_q4_v1 (CUSTOM_Q4_KERNEL_VERSION >= 2): pre-convert every Q4_0 tensor in
+// `tensors` to BOTH rotated INT4 (for the SpinQuant path) AND plain INT8 (for
+// the INT8 fallback path). Both derivatives are cached because the runtime
+// dispatch (activation incoherence score vs threshold) can pick either at any
+// moment. Safe to call once after the diffusion model is loaded, before
+// sampling starts.
+//
+// Tensors with type != GGML_TYPE_Q4_0 or with null data are skipped.
+// Returns the number of tensors converted. Synchronizes the CUDA stream
+// before returning so callers can immediately enqueue matmuls.
+int preload_q4_0_weights(const std::map<std::string, struct ggml_tensor *> & tensors);
+
 }  // namespace custom_kernels
