@@ -60,7 +60,11 @@ static void custom_ggml_q4_weight_q8_compute_kernel_cached(
         src1_ddf_i, src1_as_i8.get(), src1_scales.get(), N, K, stream);
 
     // Fused INT8 GEMM + row/col dequant -> FP32.
-    bool matmul_dequant = matmul_w8a8_cutlass_cuda(
+    // NOTE: use the CUTLASS 3.x path (matmul_w8a8_cutlass3x_cuda = amir_v5),
+    // NOT the 2.x EVT path (matmul_w8a8_cutlass_cuda = amir_v4). Thai Vu's
+    // original Q4 code called the 2.x variant because it predates amir_v5.
+    // The 3.x kernel is ~15x faster per call on Thor Blackwell (see exp021).
+    bool matmul_dequant = matmul_w8a8_cutlass3x_cuda(
         cw.d_i8,             // A: [row_diff, K] cached INT8 weights
         src1_as_i8.get(),    // B: [N, K]
         cw.d_scales_i8,      // alphaRow: [row_diff]
